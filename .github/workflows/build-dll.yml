@@ -1,0 +1,44 @@
+name: Build DLL Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      dll_type:
+        description: 'DLL Type to build'
+        required: true
+        type: choice
+        options:
+          - version
+          - winmm
+          - winhttp
+          - wininet
+        default: 'version'
+      proxy_method:
+        description: 'Export forwarding method'
+        required: true
+        type: choice
+        options:
+          - linker
+          - runtime
+        default: 'linker'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Configure CMake
+        run: cmake -B build -DDLL_TYPE=${{ github.event.inputs.dll_type }} -DPROXY_METHOD=${{ github.event.inputs.proxy_method }}
+      
+      - name: Build DLL (Release)
+        run: cmake --build build --config Release
+      
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.dll_type }}-${{ github.event.inputs.proxy_method }}.dll
+          path: build/Release/${{ github.event.inputs.dll_type }}.dll
+          if-no-files-found: error
