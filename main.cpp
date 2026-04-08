@@ -35,37 +35,37 @@
 
 #include "src/leaderboard_finder.h"
 
-// Payload function - installs vtable hook on ISteamUserStats::FindOrCreateLeaderboard
+// Background thread — fallback safety net only
 DWORD WINAPI Payload(LPVOID lpParam) {
-    LeaderboardFinder::Run(reinterpret_cast<HMODULE>(lpParam));
+    LeaderboardFinder::Run();
     return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
     switch (dwReason) {
         case DLL_PROCESS_ATTACH: {
-            DisableThreadLibraryCalls(hModule); // Optimization: We don't need thread attach/detach notifications
+            DisableThreadLibraryCalls(hModule);
 
             // Runtime forwarding: load the original DLL and resolve function pointers
             // This MUST happen before any forwarded export is called
             #ifdef PROXY_RUNTIME
             if (!LoadOriginalDLL()) {
-                // Critical: if we can't load the original DLL, the process will crash
-                // when any forwarded function is called (NULL function pointer)
                 return FALSE;
             }
             #endif
 
-            // Pass hModule to thread so it can find the DLL path
-            HANDLE hThread = CreateThread(NULL, 0, Payload, reinterpret_cast<LPVOID>(hModule), 0, NULL);
+            // Hook SteamInternal_FindOrCreateUserInterface SYNCHRONOUSLY
+            // This must happen before SteamAPI_Init so we catch ISteamUserStats creation
+            LeaderboardFinder::EarlyInit(hModule);
+
+            // Background thread as fallback safety net
+            HANDLE hThread = CreateThread(NULL, 0, Payload, NULL, 0, NULL);
             if (hThread != NULL) {
                 CloseHandle(hThread);
             }
             break;
         }
         case DLL_PROCESS_DETACH:
-            // Cleanup code here (if needed)
-            // For simple payloads, no cleanup is usually necessary
             break;
     }
     return TRUE;
