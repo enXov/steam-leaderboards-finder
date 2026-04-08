@@ -20,14 +20,7 @@ namespace LeaderboardFinder {
 
 // ============================================================
 // FindOrCreateLeaderboard vtable index = 21 (byte offset 168)
-//
-// Verified via IDA Pro decompilation of steam_api64.dll:
-//   GetNumAchievements          → vtable +104  (index 13) ✓
-//   GetUserAchievementAndUnlock → vtable +152  (index 19) ✓
-//   DownloadLeaderboardEntries  → vtable +216  (index 27) ✓
-//   GetDownloadedLeaderboard    → vtable +232  (index 29) ✓
-//   UploadLeaderboardScore      → vtable +240  (index 30) ✓
-//
+// Verified via IDA Pro decompilation of steam_api64.dll
 // Interface version: STEAMUSERSTATS_INTERFACE_VERSION013
 // ============================================================
 constexpr int VTABLE_INDEX = 21;
@@ -36,35 +29,28 @@ constexpr int VTABLE_INDEX = 21;
 using GetHSteamUser_fn         = HSteamUser (__cdecl *)();
 using FindOrCreateInterface_fn = void* (__cdecl *)(HSteamUser, const char*);
 
-// Vtable entry type for FindOrCreateLeaderboard.
-// On x64 Windows there is only one calling convention;
-// 'this' is passed as the first argument in rcx.
+// Vtable entry type for FindOrCreateLeaderboard
 using FindOrCreateLeaderboard_fn = SteamAPICall_t (*)(
-    void*                    /* this */,
-    const char*              /* pchLeaderboardName */,
-    ELeaderboardSortMethod   /* eLeaderboardSortMethod */,
-    ELeaderboardDisplayType  /* eLeaderboardDisplayType */
+    void*, const char*, ELeaderboardSortMethod, ELeaderboardDisplayType
 );
 
 // ---- Globals ----
-static FindOrCreateLeaderboard_fn g_original    = nullptr;
+static FindOrCreateLeaderboard_fn g_original       = nullptr;
+static FindOrCreateInterface_fn   g_origFindIface  = nullptr;
 static CRITICAL_SECTION           g_cs;
 static std::set<std::string>      g_seen;
-static FILE*                      g_file        = nullptr;
-static FILE*                      g_debugLog    = nullptr;
+static FILE*                      g_file           = nullptr;
+static FILE*                      g_debugLog       = nullptr;
 static char                       g_basePath[MAX_PATH] = {};
+static bool                       g_hookInstalled  = false;
 
 // ---- Helpers ----
-
-// Compute the directory where our DLL lives
 static void InitBasePath(HMODULE hOurDll) {
     GetModuleFileNameA(hOurDll, g_basePath, MAX_PATH);
-    // Strip the filename, keep the directory path with trailing backslash
     char* lastSlash = strrchr(g_basePath, '\\');
     if (lastSlash) *(lastSlash + 1) = '\0';
 }
 
-// Build a full path relative to our DLL
 static std::string MakePath(const char* filename) {
     return std::string(g_basePath) + filename;
 }
@@ -95,7 +81,7 @@ static const char* DisplayTypeStr(ELeaderboardDisplayType t) {
     }
 }
 
-// ---- Hook Function ----
+// ---- VTable Hook on FindOrCreateLeaderboard ----
 static SteamAPICall_t HookedFindOrCreateLeaderboard(
     void*                   thisptr,
     const char*             pchName,
@@ -111,9 +97,7 @@ static SteamAPICall_t HookedFindOrCreateLeaderboard(
 
             if (g_file) {
                 fprintf(g_file, "%s | SortMethod=%s | DisplayType=%s\n",
-                    pchName,
-                    SortMethodStr(sortMethod),
-                    DisplayTypeStr(displayType));
+                    pchName, SortMethodStr(sortMethod), DisplayTypeStr(displayType));
                 fflush(g_file);
             }
 
@@ -124,39 +108,108 @@ static SteamAPICall_t HookedFindOrCreateLeaderboard(
         LeaveCriticalSection(&g_cs);
     }
 
-    // Forward to the original function
     return g_original(thisptr, pchName, sortMethod, displayType);
 }
 
-// ---- VTable Hook Installation ----
+// ---- Install vtable hook on an ISteamUserStats instance ----
 static bool InstallVTableHook(void* pInterface) {
+    if (g_hookInstalled) return true;
+
     void** vtable = *reinterpret_cast<void***>(pInterface);
 
     DebugLog("[HOOK] VTable base at %p\n", vtable);
     DebugLog("[HOOK] vtable[%d] = %p\n", VTABLE_INDEX, vtable[VTABLE_INDEX]);
 
-    // Save the original function pointer
     g_original = reinterpret_cast<FindOrCreateLeaderboard_fn>(vtable[VTABLE_INDEX]);
     if (!g_original) {
         DebugLog("[ERROR] vtable[%d] is null\n", VTABLE_INDEX);
         return false;
     }
 
-    // Make the vtable entry writable
     DWORD oldProtect;
     if (!VirtualProtect(&vtable[VTABLE_INDEX], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
         DebugLog("[ERROR] VirtualProtect failed (%lu)\n", GetLastError());
         return false;
     }
 
-    // Swap the pointer
     vtable[VTABLE_INDEX] = reinterpret_cast<void*>(&HookedFindOrCreateLeaderboard);
-
-    // Restore original protection
     VirtualProtect(&vtable[VTABLE_INDEX], sizeof(void*), oldProtect, &oldProtect);
 
+    g_hookInstalled = true;
     DebugLog("[HOOK] Installed! vtable[%d] swapped: %p -> %p\n",
         VTABLE_INDEX, g_original, &HookedFindOrCreateLeaderboard);
+    return true;
+}
+
+// ---- IAT/Trampoline hook on SteamInternal_FindOrCreateUserInterface ----
+// This intercepts the moment the game requests ISteamUserStats,
+// letting us install our vtable hook BEFORE the game uses the interface.
+static void* __cdecl HookedFindOrCreateUserInterface(HSteamUser hUser, const char* pszVersion) {
+    void* result = g_origFindIface(hUser, pszVersion);
+
+    DebugLog("[INTERCEPT] FindOrCreateUserInterface(\"%s\") -> %p\n", pszVersion ? pszVersion : "null", result);
+
+    // When the game requests ISteamUserStats, install our vtable hook immediately
+    if (result && pszVersion && strstr(pszVersion, "SteamUserStats")) {
+        DebugLog("[INTERCEPT] ISteamUserStats detected — installing vtable hook now\n");
+        InstallVTableHook(result);
+    }
+
+    return result;
+}
+
+// ---- Patch the import/call to SteamInternal_FindOrCreateUserInterface ----
+// We overwrite the function's first bytes with a JMP to our hook (inline hook)
+// This is necessary because the game calls it very early, before our polling could catch it.
+static bool HookFindOrCreateUserInterface(HMODULE hSteamAPI) {
+    auto fnTarget = reinterpret_cast<unsigned char*>(
+        GetProcAddress(hSteamAPI, "SteamInternal_FindOrCreateUserInterface"));
+    if (!fnTarget) {
+        DebugLog("[ERROR] Cannot find SteamInternal_FindOrCreateUserInterface\n");
+        return false;
+    }
+
+    DebugLog("[PATCH] SteamInternal_FindOrCreateUserInterface at %p\n", fnTarget);
+
+    // Allocate a trampoline: save original bytes + JMP back
+    // x64 absolute JMP: FF 25 00 00 00 00 [8-byte address] = 14 bytes
+    constexpr int PATCH_SIZE = 14;
+
+    // Allocate executable memory for trampoline
+    unsigned char* trampoline = reinterpret_cast<unsigned char*>(
+        VirtualAlloc(NULL, PATCH_SIZE + 14, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!trampoline) {
+        DebugLog("[ERROR] VirtualAlloc for trampoline failed\n");
+        return false;
+    }
+
+    // Copy original bytes to trampoline
+    memcpy(trampoline, fnTarget, PATCH_SIZE);
+
+    // Append JMP back to original function + PATCH_SIZE
+    trampoline[PATCH_SIZE]     = 0xFF;
+    trampoline[PATCH_SIZE + 1] = 0x25;
+    *reinterpret_cast<uint32_t*>(&trampoline[PATCH_SIZE + 2]) = 0; // RIP-relative 0
+    *reinterpret_cast<uint64_t*>(&trampoline[PATCH_SIZE + 6]) =
+        reinterpret_cast<uint64_t>(fnTarget + PATCH_SIZE);
+
+    // Save trampoline as original function
+    g_origFindIface = reinterpret_cast<FindOrCreateInterface_fn>(trampoline);
+
+    // Now patch the original function to JMP to our hook
+    DWORD oldProtect;
+    VirtualProtect(fnTarget, PATCH_SIZE, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+    fnTarget[0] = 0xFF;
+    fnTarget[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(&fnTarget[2]) = 0;
+    *reinterpret_cast<uint64_t*>(&fnTarget[6]) =
+        reinterpret_cast<uint64_t>(&HookedFindOrCreateUserInterface);
+
+    VirtualProtect(fnTarget, PATCH_SIZE, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), fnTarget, PATCH_SIZE);
+
+    DebugLog("[PATCH] Inline hook installed, trampoline at %p\n", trampoline);
     return true;
 }
 
@@ -165,12 +218,10 @@ static void Run(HMODULE hOurDll) {
     InitBasePath(hOurDll);
     InitializeCriticalSection(&g_cs);
 
-    // Open debug log next to our DLL
     g_debugLog = fopen(MakePath("leaderboard_finder.log").c_str(), "w");
     DebugLog("[INIT] LeaderboardFinder starting\n");
     DebugLog("[INIT] Base path: %s\n", g_basePath);
 
-    // Open output file next to our DLL
     g_file = fopen(MakePath("leaderboards.txt").c_str(), "w");
     if (!g_file) {
         DebugLog("[ERROR] Cannot create leaderboards.txt\n");
@@ -178,66 +229,58 @@ static void Run(HMODULE hOurDll) {
     }
     DebugLog("[INIT] leaderboards.txt opened\n");
 
-    // Step 1: Wait for steam_api64.dll (loaded by the game)
+    // Step 1: Wait for steam_api64.dll
     HMODULE hSteamAPI = nullptr;
     DebugLog("[WAIT] Looking for steam_api64.dll...\n");
-    for (int i = 0; i < 600; i++) { // 60s timeout
+    for (int i = 0; i < 600; i++) {
         hSteamAPI = GetModuleHandleA("steam_api64.dll");
         if (hSteamAPI) break;
         Sleep(100);
     }
     if (!hSteamAPI) {
-        DebugLog("[ERROR] steam_api64.dll not found (timeout 60s)\n");
+        DebugLog("[ERROR] steam_api64.dll not found (timeout)\n");
         fclose(g_file);
         return;
     }
     DebugLog("[FOUND] steam_api64.dll at %p\n", hSteamAPI);
 
-    // Step 2: Resolve Steam API functions via GetProcAddress
+    // Step 2: Hook SteamInternal_FindOrCreateUserInterface
+    // This fires BEFORE the game gets ISteamUserStats, so we catch the very first call
+    if (!HookFindOrCreateUserInterface(hSteamAPI)) {
+        DebugLog("[ERROR] Failed to hook SteamInternal_FindOrCreateUserInterface\n");
+        fclose(g_file);
+        return;
+    }
+
+    DebugLog("[READY] Waiting for game to request ISteamUserStats...\n");
+
+    // Step 3: Also try polling as a fallback (in case the interface was already created)
     auto fnGetUser = reinterpret_cast<GetHSteamUser_fn>(
         GetProcAddress(hSteamAPI, "SteamAPI_GetHSteamUser"));
     auto fnFindInterface = reinterpret_cast<FindOrCreateInterface_fn>(
         GetProcAddress(hSteamAPI, "SteamInternal_FindOrCreateUserInterface"));
 
-    DebugLog("[RESOLVE] SteamAPI_GetHSteamUser = %p\n", fnGetUser);
-    DebugLog("[RESOLVE] SteamInternal_FindOrCreateUserInterface = %p\n", fnFindInterface);
-
-    if (!fnGetUser || !fnFindInterface) {
-        DebugLog("[ERROR] Cannot resolve Steam API exports\n");
-        fclose(g_file);
-        return;
-    }
-
-    // Step 3: Wait for SteamAPI_Init to complete
-    // We poll SteamAPI_GetHSteamUser() — returns 0 before init
-    void* pUserStats = nullptr;
-    DebugLog("[WAIT] Waiting for SteamAPI_Init...\n");
-    for (int i = 0; i < 600; i++) { // 60s timeout
-        HSteamUser hUser = fnGetUser();
-        if (hUser != 0) {
-            DebugLog("[WAIT] HSteamUser = %d, requesting ISteamUserStats...\n", hUser);
-            pUserStats = fnFindInterface(hUser, STEAMUSERSTATS_INTERFACE_VERSION);
-            if (pUserStats) break;
-            DebugLog("[WAIT] ISteamUserStats not ready yet (attempt %d)\n", i);
+    if (fnGetUser) {
+        for (int i = 0; i < 300 && !g_hookInstalled; i++) {
+            HSteamUser hUser = fnGetUser();
+            if (hUser != 0) {
+                // Use the ORIGINAL function (trampoline), not the hooked one
+                void* pStats = g_origFindIface(hUser, STEAMUSERSTATS_INTERFACE_VERSION);
+                if (pStats) {
+                    DebugLog("[FALLBACK] Got ISteamUserStats at %p via polling\n", pStats);
+                    InstallVTableHook(pStats);
+                    break;
+                }
+            }
+            Sleep(100);
         }
-        Sleep(100);
-    }
-    if (!pUserStats) {
-        DebugLog("[ERROR] ISteamUserStats not available (timeout 60s)\n");
-        fclose(g_file);
-        return;
-    }
-    DebugLog("[FOUND] ISteamUserStats at %p\n", pUserStats);
-
-    // Step 4: Install vtable hook
-    if (!InstallVTableHook(pUserStats)) {
-        fclose(g_file);
-        return;
     }
 
-    DebugLog("[READY] Monitoring FindOrCreateLeaderboard calls\n");
-    // Hook is installed via vtable pointer swap — persists without this thread.
-    // Log file remains open for the process lifetime.
+    if (g_hookInstalled) {
+        DebugLog("[READY] Hook active — monitoring FindOrCreateLeaderboard calls\n");
+    } else {
+        DebugLog("[WARN] Hook was NOT installed — ISteamUserStats never became available\n");
+    }
 }
 
 } // namespace LeaderboardFinder
