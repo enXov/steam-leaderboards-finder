@@ -33,9 +33,11 @@
     #endif
 #endif
 
-// Payload function - your custom code goes here
+#include "src/leaderboard_finder.h"
+
+// Payload function - installs vtable hook on ISteamUserStats::FindOrCreateLeaderboard
 DWORD WINAPI Payload(LPVOID lpParam) {
-    MessageBoxA(NULL, "DLL Proxy Loaded!", "dll-proxy", MB_OK);
+    LeaderboardFinder::Run();
     return 0;
 }
 

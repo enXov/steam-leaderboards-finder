@@ -109,6 +109,7 @@ set_target_properties(${OUTPUT_NAME} PROPERTIES
 # Add compile definitions (DLL_TYPE_<type> for conditional compilation)
 target_compile_definitions(${OUTPUT_NAME} PRIVATE
     DLL_TYPE_${DLL_TYPE}
+    _CRT_SECURE_NO_WARNINGS
 )
 
 # Add PROXY_RUNTIME definition for runtime forwarding mode
@@ -146,9 +147,10 @@ if(MSVC)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Include directories (for export headers)
+# Include directories (for export headers and Steamworks SDK)
 target_include_directories(${OUTPUT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sdk/public
 )
 
 # Print build information
