@@ -19,29 +19,33 @@
 namespace LeaderboardFinder {
 
 // ============================================================
-// FindOrCreateLeaderboard vtable index = 21 (byte offset 168)
-// Verified via IDA Pro decompilation of steam_api64.dll
+// Vtable indices (verified via IDA Pro decompilation)
+//   FindOrCreateLeaderboard: index 21 (offset 168)
+//   FindLeaderboard:         index 22 (offset 176)
 // Interface version: STEAMUSERSTATS_INTERFACE_VERSION013
 // ============================================================
-constexpr int VTABLE_INDEX = 21;
+constexpr int VTIDX_FIND_OR_CREATE = 21;
+constexpr int VTIDX_FIND           = 22;
 
 // ---- Runtime-resolved function types ----
 using FindOrCreateInterface_fn = void* (__cdecl *)(HSteamUser, const char*);
 
-// Vtable entry type for FindOrCreateLeaderboard
-using FindOrCreateLeaderboard_fn = SteamAPICall_t (*)(
-    void*, const char*, ELeaderboardSortMethod, ELeaderboardDisplayType
-);
+// Vtable entry: FindOrCreateLeaderboard(this, name, sort, display) -> SteamAPICall_t
+using FindOrCreateLeaderboard_fn = SteamAPICall_t (*)(void*, const char*, ELeaderboardSortMethod, ELeaderboardDisplayType);
+
+// Vtable entry: FindLeaderboard(this, name) -> SteamAPICall_t
+using FindLeaderboard_fn = SteamAPICall_t (*)(void*, const char*);
 
 // ---- Globals ----
-static FindOrCreateLeaderboard_fn g_original       = nullptr;
-static FindOrCreateInterface_fn   g_origFindIface  = nullptr;
+static FindOrCreateLeaderboard_fn g_origFindOrCreate = nullptr;
+static FindLeaderboard_fn         g_origFind         = nullptr;
+static FindOrCreateInterface_fn   g_origFindIface    = nullptr;
 static CRITICAL_SECTION           g_cs;
 static std::set<std::string>      g_seen;
-static FILE*                      g_file           = nullptr;
-static FILE*                      g_debugLog       = nullptr;
+static FILE*                      g_file             = nullptr;
+static FILE*                      g_debugLog         = nullptr;
 static char                       g_basePath[MAX_PATH] = {};
-static bool                       g_vtableHooked   = false;
+static bool                       g_vtableHooked     = false;
 
 // ---- Helpers ----
 static void InitBasePath(HMODULE hOurDll) {
@@ -80,63 +84,82 @@ static const char* DisplayTypeStr(ELeaderboardDisplayType t) {
     }
 }
 
-// ---- VTable Hook on FindOrCreateLeaderboard ----
+// ---- Shared logging helper ----
+static void LogLeaderboard(const char* pchName, const char* sortStr, const char* displayStr) {
+    if (!pchName) return;
+    EnterCriticalSection(&g_cs);
+
+    std::string name(pchName);
+    if (g_seen.find(name) == g_seen.end()) {
+        g_seen.insert(name);
+
+        if (g_file) {
+            fprintf(g_file, "%s | SortMethod=%s | DisplayType=%s\n",
+                pchName, sortStr, displayStr);
+            fflush(g_file);
+        }
+
+        DebugLog("[HOOK] Found: %s | Sort=%s | Display=%s\n",
+            pchName, sortStr, displayStr);
+    }
+
+    LeaveCriticalSection(&g_cs);
+}
+
+// ---- Hook: FindOrCreateLeaderboard (index 21) ----
 static SteamAPICall_t HookedFindOrCreateLeaderboard(
     void*                   thisptr,
     const char*             pchName,
     ELeaderboardSortMethod  sortMethod,
     ELeaderboardDisplayType displayType)
 {
-    if (pchName) {
-        EnterCriticalSection(&g_cs);
-
-        std::string name(pchName);
-        if (g_seen.find(name) == g_seen.end()) {
-            g_seen.insert(name);
-
-            if (g_file) {
-                fprintf(g_file, "%s | SortMethod=%s | DisplayType=%s\n",
-                    pchName, SortMethodStr(sortMethod), DisplayTypeStr(displayType));
-                fflush(g_file);
-            }
-
-            DebugLog("[HOOK] Found: %s | Sort=%s | Display=%s\n",
-                pchName, SortMethodStr(sortMethod), DisplayTypeStr(displayType));
-        }
-
-        LeaveCriticalSection(&g_cs);
-    }
-
-    return g_original(thisptr, pchName, sortMethod, displayType);
+    LogLeaderboard(pchName, SortMethodStr(sortMethod), DisplayTypeStr(displayType));
+    return g_origFindOrCreate(thisptr, pchName, sortMethod, displayType);
 }
 
-// ---- Install vtable hook on an ISteamUserStats instance ----
+// ---- Hook: FindLeaderboard (index 22) ----
+static SteamAPICall_t HookedFindLeaderboard(
+    void*       thisptr,
+    const char* pchName)
+{
+    LogLeaderboard(pchName, "N/A", "N/A");
+    return g_origFind(thisptr, pchName);
+}
+
+// ---- Install vtable hooks on an ISteamUserStats instance ----
 static bool InstallVTableHook(void* pInterface) {
     if (g_vtableHooked) return true;
 
     void** vtable = *reinterpret_cast<void***>(pInterface);
 
     DebugLog("[HOOK] VTable base at %p\n", vtable);
-    DebugLog("[HOOK] vtable[%d] = %p\n", VTABLE_INDEX, vtable[VTABLE_INDEX]);
+    DebugLog("[HOOK] vtable[%d] (FindOrCreate) = %p\n", VTIDX_FIND_OR_CREATE, vtable[VTIDX_FIND_OR_CREATE]);
+    DebugLog("[HOOK] vtable[%d] (Find)         = %p\n", VTIDX_FIND, vtable[VTIDX_FIND]);
 
-    g_original = reinterpret_cast<FindOrCreateLeaderboard_fn>(vtable[VTABLE_INDEX]);
-    if (!g_original) {
-        DebugLog("[ERROR] vtable[%d] is null\n", VTABLE_INDEX);
+    // Save originals
+    g_origFindOrCreate = reinterpret_cast<FindOrCreateLeaderboard_fn>(vtable[VTIDX_FIND_OR_CREATE]);
+    g_origFind         = reinterpret_cast<FindLeaderboard_fn>(vtable[VTIDX_FIND]);
+
+    if (!g_origFindOrCreate || !g_origFind) {
+        DebugLog("[ERROR] vtable entries are null\n");
         return false;
     }
 
+    // Make both entries writable (they're adjacent)
     DWORD oldProtect;
-    if (!VirtualProtect(&vtable[VTABLE_INDEX], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(&vtable[VTIDX_FIND_OR_CREATE], sizeof(void*) * 2, PAGE_READWRITE, &oldProtect)) {
         DebugLog("[ERROR] VirtualProtect failed (%lu)\n", GetLastError());
         return false;
     }
 
-    vtable[VTABLE_INDEX] = reinterpret_cast<void*>(&HookedFindOrCreateLeaderboard);
-    VirtualProtect(&vtable[VTABLE_INDEX], sizeof(void*), oldProtect, &oldProtect);
+    vtable[VTIDX_FIND_OR_CREATE] = reinterpret_cast<void*>(&HookedFindOrCreateLeaderboard);
+    vtable[VTIDX_FIND]           = reinterpret_cast<void*>(&HookedFindLeaderboard);
+
+    VirtualProtect(&vtable[VTIDX_FIND_OR_CREATE], sizeof(void*) * 2, oldProtect, &oldProtect);
 
     g_vtableHooked = true;
-    DebugLog("[HOOK] Installed! vtable[%d] swapped: %p -> %p\n",
-        VTABLE_INDEX, g_original, &HookedFindOrCreateLeaderboard);
+    DebugLog("[HOOK] Both hooks installed! FindOrCreate[%d] + Find[%d]\n",
+        VTIDX_FIND_OR_CREATE, VTIDX_FIND);
     return true;
 }
 
