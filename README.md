@@ -51,11 +51,27 @@ cmake --build build --config Release
 4. Play through the game (navigate to leaderboard screens, different modes, etc.)
 5. Check `leaderboards.txt` next to the game executable for discovered leaderboard names
 
+## Why This Approach?
+
+`FindLeaderboard` is a C++ virtual method — it doesn't have a fixed address you can hook directly. It only exists as a pointer inside the `ISteamUserStats` vtable. To hook it, you first need the `ISteamUserStats*` pointer so you can swap its vtable entry.
+
+The naive approach is to poll for the interface from a background thread. But this creates a **race condition**: the game creates `ISteamUserStats` and calls `FindLeaderboard` on the main thread so fast that a background thread can't install the hook in time.
+
+The solution is to hook `SteamInternal_FindOrCreateUserInterface` — the function that *creates* `ISteamUserStats`. This way, the moment the game requests the interface, our hook fires first, swaps the vtable, and returns the modified interface to the game. By the time the game calls `FindLeaderboard`, our hook is already in place.
+
+```
+Game:  SteamAPI_Init() → SteamInternal_FindOrCreateUserInterface("STEAMUSERSTATS...")
+                              ↓
+                         OUR HOOK → get ISteamUserStats* → swap vtable[22] → return to game
+                              ↓
+Game:  FindLeaderboard("Normal Leaderboard") → hits our hook ✅ → logged to file
+```
+
 ## Technical Details
 
 - **Interface**: `STEAMUSERSTATS_INTERFACE_VERSION013`
 - **VTable Indices**: `FindOrCreateLeaderboard` at 21 (offset 168), `FindLeaderboard` at 22 (offset 176)
-- **Hooking**: Inline hook (x64 absolute JMP) + vtable pointer swap
+- **Hooking**: Inline hook (x64 absolute JMP) on `SteamInternal_FindOrCreateUserInterface` + vtable pointer swap
 - **SDK**: Only public headers included for type definitions — no library linking
 
 ## Credits
