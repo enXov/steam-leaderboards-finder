@@ -149,7 +149,7 @@ static void* __cdecl HookedFindOrCreateUserInterface(HSteamUser hUser, const cha
     DebugLog("[INTERCEPT] FindOrCreateUserInterface(\"%s\") -> %p\n",
         pszVersion ? pszVersion : "null", result);
 
-    if (result && pszVersion && strstr(pszVersion, "SteamUserStats")) {
+    if (result && pszVersion && strcmp(pszVersion, STEAMUSERSTATS_INTERFACE_VERSION) == 0) {
         DebugLog("[INTERCEPT] ISteamUserStats detected — installing vtable hook\n");
         InstallVTableHook(result);
     }
