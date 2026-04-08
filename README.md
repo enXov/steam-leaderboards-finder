@@ -1,153 +1,67 @@
-<div align="center">
-  <img src="screenshoots/1.png" width="100%"/>
-</div>
+# Steam Leaderboards Finder
 
-<div align="center">
-  <img src="screenshoots/2.png" width="100%"/>
-</div>
+Automatically discovers Steam leaderboard names used by any game by hooking the `ISteamUserStats` interface at runtime.
 
----
+## Why This Project Exists
 
-## It's This Simple
+To use the Steam API's `UploadLeaderboardScore` function, you need a leaderboard handle — which you get by calling `FindLeaderboard` with the **exact leaderboard name**. But Steam doesn't provide a way to list all leaderboards for a game, and the names are only known to the game developer.
 
-**You don't need to know anything complex to get started.** Just edit this one function in `main.cpp`:
+This tool solves that by intercepting the game's own calls to `FindLeaderboard` and logging the names it uses. Once you have the names, you can use them in your own project to upload scores, download entries, or interact with the leaderboards programmatically.
 
-```cpp
-// Payload function - your custom code goes here
-DWORD WINAPI Payload(LPVOID lpParam) {
-    MessageBoxA(NULL, "DLL Proxy Loaded!", "dll-proxy", MB_OK);
-    return 0;
-}
-```
+👉 **See [steam-leaderboards](https://github.com/enXov/steam-leaderboards) for actually uploading scores and interacting with leaderboards.**
 
-That's it! Build, drop the DLL next to your target application, and your code runs instantly.
+## How It Works
 
----
+1. Gets loaded by the game at startup via a commonly loaded Windows DLL
+2. Patches `SteamInternal_FindOrCreateUserInterface` to intercept `ISteamUserStats` creation
+3. Swaps vtable entries for `FindLeaderboard` (index 22) and `FindOrCreateLeaderboard` (index 21) with hooks
+4. Writes discovered leaderboard names to `leaderboards.txt`
 
-## Why This Exists
-
-Many of the applications, tools, or whatever I used generally utilized something called winmm.dll, and after approximately 2-3 days of research, I decided to build this project to make the process as simple as possible.
-
-The project started with pure MSVC pragma forwarding — no `.def` files, no assembly, no manual stubs. Just one `#pragma` per export. That worked great for most applications.
-
-But some applications — particularly games built with complex engines(UE 5) — crashed immediately on launch. The PE loader's automatic resolution of pragma-level export forwarders conflicted with their aggressive multi-threaded startup and module validation. The crash happened at loader level, before our code even ran.
-
-To fix this, I added **runtime forwarding** — `LoadLibrary` + `GetProcAddress` + MASM x64 jump thunks. Both methods now ship in the same project, selectable with a single CMake flag (`-DPROXY_METHOD=runtime`).
-
-## Forwarding Methods
-
-This project supports two export forwarding architectures:
-
-### Linker Forwarding (default)
-
-Uses MSVC-specific `#pragma comment(linker, ...)` directives to set up PE-level export forwarding. The Windows loader resolves these at load time — no runtime code needed.
-
-```cpp
-#pragma comment(linker, "/EXPORT:FuncName=\\\\.\\GLOBALROOT\\SystemRoot\\System32\\original.dll.FuncName,@1")
-```
-
-### Runtime Forwarding
-
-Uses `LoadLibrary` + `GetProcAddress` to manually resolve the original DLL at startup, with MASM x64 jump thunks providing the actual exported functions.
+## Output Format
 
 ```
-┌─────────────┐      ┌──────────────────┐      ┌─────────────────┐
-│  App.exe    │────▶│  proxy winmm.dll │────▶│ System winmm.dll│
-│             │      │                  │      │  (System32)     │
-│ calls       │      │ 1. LoadLibraryA  │      │                 │
-│ timeGetTime │      │ 2. GetProcAddress│      │ Real functions  │
-│             │      │ 3. ASM JMP thunk │      │                 │
-└─────────────┘      └──────────────────┘      └─────────────────┘
+Normal Leaderboard | SortMethod=N/A | DisplayType=N/A
+Hard Leaderboard | SortMethod=Ascending | DisplayType=Numeric
 ```
 
-## Supported DLLs
+## Building
 
-| DLL Name | Exports | Linker | Runtime | Common Usage |
-|----------|---------|--------|---------|-------------|
-| `version.dll` | 17 | ✅ | ✅ | File version info API |
-| `winmm.dll` | 181 | ✅ | ✅ | Multimedia/audio — games, media players |
-| `winhttp.dll` | 91 | ✅ | ✅ | HTTP client API — updaters, web apps |
-| `wininet.dll` | 327 | ✅ | ✅ | Internet functions — browsers, networking |
+Requires MSVC (x64). Build via GitHub Actions:
 
-### Find Which DLLs an Application Loads
+1. Go to **Actions** → **Build DLL Proxy**
+2. Select `winmm` as DLL type and `runtime` as proxy method
+3. Download the artifact
 
-```powershell
-Get-Process -Name your_app | Select-Object -ExpandProperty Modules | Select-Object FileName
-```
-
-## Adding new DLLs
-
-For adding new dlls look the original_dlls/README.md, its pretty easy.
-
-## Quick Start
-
-## Requirements
-
-- **Compiler**: MSVC (Visual Studio 2019+)
-- **Build**: CMake 3.15+
-- **Target**: Windows x64 only (no 32-bit support)
-
-### Windows (Local Build)
+Or build locally:
 
 ```bash
-# Linker forwarding (default, simple)
-cmake -B build -DDLL_TYPE=version
-cmake --build build --config Release
-
-# Runtime forwarding (maximum compatibility)
 cmake -B build -DDLL_TYPE=winmm -DPROXY_METHOD=runtime
 cmake --build build --config Release
 ```
 
-Output: `build/Release/version.dll` (or `winmm.dll`, `winhttp.dll`, `wininet.dll`)
-
-### Linux (GitHub Actions)
-
-1. Push to GitHub
-2. Go to **Actions** → **Build DLL Proxy**
-3. Select DLL type and proxy method
-4. Download the artifact
-
-
 ## Usage
 
-### Windows
+1. Place the built DLL in the game's executable directory (next to the `.exe`)
+2. Add the following to Steam launch options:
+   ```
+   WINEDLLOVERRIDES="winmm=n,b" %command%
+   ```
+   *(On native Windows, no launch options are needed — the DLL loads automatically)*
+3. Launch the game normally
+4. Play through the game (navigate to leaderboard screens, different modes, etc.)
+5. Check `leaderboards.txt` next to the game executable for discovered leaderboard names
 
-1. Build proxy DLL (e.g., `version.dll`)
-2. Place in target application directory
-3. Run application - payload executes on DLL load
+## Technical Details
 
-### Linux (Wine/Proton)
-
-1. Build proxy DLL via GitHub Actions
-2. Place DLL in the game/application directory
-3. Set DLL override environment variable:
-
-```bash
-# For Wine applications
-WINEDLLOVERRIDES="winmm=n,b" wine your_application.exe
-
-# For Steam games (add to launch options)
-WINEDLLOVERRIDES="winmm=n,b" %command%
-
-# Multiple DLLs
-WINEDLLOVERRIDES="winmm=n,b;version=n,b" %command%
-```
-
-**Override flags:**
-- `n` = native (load Windows DLL first)
-- `b` = builtin (fallback to Wine's builtin implementation)
+- **Interface**: `STEAMUSERSTATS_INTERFACE_VERSION013`
+- **VTable Indices**: `FindOrCreateLeaderboard` at 21 (offset 168), `FindLeaderboard` at 22 (offset 176)
+- **Hooking**: Inline hook (x64 absolute JMP) + vtable pointer swap
+- **SDK**: Only public headers included for type definitions — no library linking
 
 ## Credits
 
-- [Perfect DLL Proxy](https://github.com/mrexodia/perfect-dll-proxy) by mrexodia — The pragma forwarding technique and `GLOBALROOT` path approach that this project is built on.
-- [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) — Unreal Engine modding framework whose runtime proxy architecture (LoadLibrary + GetProcAddress + ASM thunks) inspired our runtime forwarding method.
-- [ReShade](https://github.com/crosire/reshade) — Graphics post-processing injector that uses the same DLL proxy + runtime forwarding pattern, confirming this as the industry-standard approach.
-
-## Disclaimer
-
-This software is provided "as is" under the MIT License. As stated in the MIT License, we accept no responsibility or liability for any use or misuse of this tool.
+This project was built using **[dll-proxy](https://github.com/enXov/dll-proxy)**. This README intentionally does not go into detail about how the DLL injection mechanism works — for a full explanation of the DLL proxy concept, how export forwarding works, and how to use it for your own projects, refer to that repository.
 
 ## License
 
-MIT - See LICENSE file
+MIT — see [LICENSE](LICENSE) for details.
