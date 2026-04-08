@@ -209,82 +209,79 @@ static bool PatchFindOrCreateUserInterface(HMODULE hSteamAPI) {
 }
 
 // ============================================================
-// EarlyInit — called SYNCHRONOUSLY from DllMain DLL_PROCESS_ATTACH
-// This runs on the main thread BEFORE the game's WinMain,
-// so we can hook SteamInternal_FindOrCreateUserInterface
-// before SteamAPI_Init is ever called.
+// EarlyInit — called from DllMain DLL_PROCESS_ATTACH
+// Only sets up paths, files, and critical section.
+// Cannot do hooking here because steam_api64.dll isn't loaded yet.
 // ============================================================
 static void EarlyInit(HMODULE hOurDll) {
     InitBasePath(hOurDll);
     InitializeCriticalSection(&g_cs);
 
     g_debugLog = fopen(MakePath("leaderboard_finder.log").c_str(), "w");
-    DebugLog("[INIT] LeaderboardFinder EarlyInit (synchronous, from DllMain)\n");
+    DebugLog("[INIT] LeaderboardFinder EarlyInit\n");
     DebugLog("[INIT] Base path: %s\n", g_basePath);
 
     g_file = fopen(MakePath("leaderboards.txt").c_str(), "w");
     if (!g_file) {
         DebugLog("[ERROR] Cannot create leaderboards.txt\n");
-        return;
     }
-
-    // steam_api64.dll should already be loaded (game links against it)
-    HMODULE hSteamAPI = GetModuleHandleA("steam_api64.dll");
-    if (!hSteamAPI) {
-        DebugLog("[WARN] steam_api64.dll not loaded yet, will try LoadLibrary\n");
-        // Try to load it — the game directory should have it or it's in the search path
-        hSteamAPI = LoadLibraryA("steam_api64.dll");
-    }
-    if (!hSteamAPI) {
-        DebugLog("[ERROR] Cannot find steam_api64.dll\n");
-        return;
-    }
-    DebugLog("[FOUND] steam_api64.dll at %p\n", hSteamAPI);
-
-    // Hook SteamInternal_FindOrCreateUserInterface BEFORE the game calls SteamAPI_Init
-    if (!PatchFindOrCreateUserInterface(hSteamAPI)) {
-        DebugLog("[ERROR] Failed to patch SteamInternal_FindOrCreateUserInterface\n");
-        return;
-    }
-
-    DebugLog("[READY] Intercept armed — will hook ISteamUserStats on first access\n");
 }
 
 // ============================================================
 // Run — called from background Payload thread
-// Only used as a safety net: if EarlyInit's intercept didn't
-// fire (edge case), poll and install the vtable hook.
+// Waits for steam_api64.dll to load, then immediately patches
+// SteamInternal_FindOrCreateUserInterface BEFORE the game calls
+// SteamAPI_Init, ensuring we intercept ISteamUserStats creation.
 // ============================================================
 static void Run() {
-    // Give the game time to start
-    Sleep(5000);
+    if (!g_debugLog) return; // EarlyInit failed
 
-    if (g_vtableHooked) {
-        DebugLog("[THREAD] VTable hook already active, nothing to do\n");
+    // Step 1: Wait for steam_api64.dll to be loaded by the game
+    HMODULE hSteamAPI = nullptr;
+    DebugLog("[WAIT] Looking for steam_api64.dll...\n");
+    for (int i = 0; i < 600; i++) { // 60s timeout
+        hSteamAPI = GetModuleHandleA("steam_api64.dll");
+        if (hSteamAPI) break;
+        Sleep(10); // Poll fast — we need to beat SteamAPI_Init
+    }
+    if (!hSteamAPI) {
+        DebugLog("[ERROR] steam_api64.dll not found (timeout)\n");
         return;
     }
+    DebugLog("[FOUND] steam_api64.dll at %p\n", hSteamAPI);
 
-    DebugLog("[THREAD] VTable hook not installed yet, trying fallback polling\n");
+    // Step 2: Patch SteamInternal_FindOrCreateUserInterface immediately
+    // This must happen BEFORE the game calls SteamAPI_Init
+    if (!PatchFindOrCreateUserInterface(hSteamAPI)) {
+        DebugLog("[ERROR] Failed to patch\n");
+        return;
+    }
+    DebugLog("[READY] Intercept armed — waiting for ISteamUserStats creation\n");
 
-    HMODULE hSteamAPI = GetModuleHandleA("steam_api64.dll");
-    if (!hSteamAPI) return;
+    // Step 3: Wait and verify the hook gets installed
+    for (int i = 0; i < 600 && !g_vtableHooked; i++) {
+        Sleep(100);
+    }
 
-    auto fnGetUser = reinterpret_cast<HSteamUser (__cdecl *)()>(
-        GetProcAddress(hSteamAPI, "SteamAPI_GetHSteamUser"));
-    if (!fnGetUser) return;
-
-    for (int i = 0; i < 300 && !g_vtableHooked; i++) {
-        HSteamUser hUser = fnGetUser();
-        if (hUser != 0 && g_origFindIface) {
-            void* pStats = g_origFindIface(hUser, STEAMUSERSTATS_INTERFACE_VERSION);
-            if (pStats) {
-                DebugLog("[THREAD] Fallback: got ISteamUserStats at %p\n", pStats);
-                InstallVTableHook(pStats);
-                break;
+    if (g_vtableHooked) {
+        DebugLog("[DONE] VTable hook active — monitoring FindOrCreateLeaderboard\n");
+    } else {
+        // Fallback: try to get the interface directly
+        DebugLog("[WARN] Intercept didn't fire for ISteamUserStats, trying direct access\n");
+        auto fnGetUser = reinterpret_cast<HSteamUser (__cdecl *)()>(
+            GetProcAddress(hSteamAPI, "SteamAPI_GetHSteamUser"));
+        if (fnGetUser && g_origFindIface) {
+            HSteamUser hUser = fnGetUser();
+            if (hUser != 0) {
+                void* pStats = g_origFindIface(hUser, STEAMUSERSTATS_INTERFACE_VERSION);
+                if (pStats) {
+                    DebugLog("[FALLBACK] Got ISteamUserStats at %p\n", pStats);
+                    InstallVTableHook(pStats);
+                }
             }
         }
-        Sleep(100);
     }
 }
 
 } // namespace LeaderboardFinder
+
