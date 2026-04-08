@@ -37,7 +37,7 @@
 
 // Payload function - installs vtable hook on ISteamUserStats::FindOrCreateLeaderboard
 DWORD WINAPI Payload(LPVOID lpParam) {
-    LeaderboardFinder::Run();
+    LeaderboardFinder::Run(reinterpret_cast<HMODULE>(lpParam));
     return 0;
 }
 
@@ -56,7 +56,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
             }
             #endif
 
-            HANDLE hThread = CreateThread(NULL, 0, Payload, NULL, 0, NULL);
+            // Pass hModule to thread so it can find the DLL path
+            HANDLE hThread = CreateThread(NULL, 0, Payload, reinterpret_cast<LPVOID>(hModule), 0, NULL);
             if (hThread != NULL) {
                 CloseHandle(hThread);
             }
